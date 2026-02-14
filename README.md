@@ -20,6 +20,13 @@ curl -fsSL https://raw.githubusercontent.com/SauersML/claudporter/main/claudport
 
 - `--include-thinking`
 - `--keep-noise`
+- `--omit-read-file-content` (skips large `Read` tool file dumps like `1→...` lines in `TOOL_RESULT`)
 - `--source /path/to/session.jsonl`
 - `--output /path/to/output.txt`
 - `--remove-token "exact_string"` (repeatable)
+
+Example:
+
+```bash
+python3 claudporter.py --omit-read-file-content
+```

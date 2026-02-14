@@ -26,6 +26,7 @@ DEFAULT_GIBBERISH_TOKEN = (
 NOISE_RE = re.compile(
     r"^<local-command|^<command-name>|^<local-command-stdout>|^<local-command-caveat>|^\[Request interrupted by user\]$"
 )
+READ_FILE_LINE_RE = re.compile(r"^\s*\d+→")
 
 RAW_JSON_EVENT_KEYS = {
     "parentUuid",
@@ -75,6 +76,11 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Extra exact token string(s) to remove from final text (can repeat)",
+    )
+    parser.add_argument(
+        "--omit-read-file-content",
+        action="store_true",
+        help="Omit Read tool file-content dumps (TOOL_RESULT blocks with numbered arrow lines)",
     )
     return parser.parse_args()
 
@@ -139,7 +145,17 @@ def strip_raw_json_event_lines(text: str) -> str:
     return "\n".join(cleaned).strip()
 
 
-def extract_items(message: dict, include_thinking: bool) -> Iterable[tuple[str, str]]:
+def looks_like_read_file_dump(text: str) -> bool:
+    # Claude's Read tool file dumps are typically lines like "1→...".
+    return sum(1 for line in text.splitlines() if READ_FILE_LINE_RE.match(line)) >= 2
+
+
+def extract_items(
+    message: dict,
+    include_thinking: bool,
+    tool_use_names: dict[str, str],
+    omit_read_file_content: bool,
+) -> Iterable[tuple[str, str]]:
     content = message.get("content")
     if isinstance(content, str):
         yield "", content
@@ -158,6 +174,9 @@ def extract_items(message: dict, include_thinking: bool) -> Iterable[tuple[str, 
                 yield "THINKING", part.get("thinking", "")
         elif ptype == "tool_use":
             name = part.get("name", "")
+            tool_use_id = part.get("id", "")
+            if isinstance(tool_use_id, str) and tool_use_id and isinstance(name, str) and name:
+                tool_use_names[tool_use_id] = name
             payload = kv_lines(part.get("input"))
             text = f"name: {name}" + (f"\n{payload}" if payload else "")
             yield "TOOL_USE", text
@@ -165,6 +184,9 @@ def extract_items(message: dict, include_thinking: bool) -> Iterable[tuple[str, 
             tool_use_id = part.get("tool_use_id", "")
             header = f"tool_use_id: {tool_use_id}\n" if tool_use_id else ""
             body = stringify(part.get("content", ""))
+            tool_name = tool_use_names.get(tool_use_id, "").lower() if isinstance(tool_use_id, str) else ""
+            if omit_read_file_content and tool_name == "read" and looks_like_read_file_dump(body):
+                continue
             yield "TOOL_RESULT", header + body
         else:
             # Preserve any other content types in a readable form.
@@ -197,8 +219,14 @@ def row_to_context(row: dict) -> tuple[str, str, dict] | None:
     return None
 
 
-def extract_plain_text(source: Path, include_thinking: bool, keep_noise: bool) -> str:
+def extract_plain_text(
+    source: Path,
+    include_thinking: bool,
+    keep_noise: bool,
+    omit_read_file_content: bool,
+) -> str:
     out_chunks: list[str] = []
+    tool_use_names: dict[str, str] = {}
 
     with source.open("r", encoding="utf-8") as f:
         for lineno, line in enumerate(f, start=1):
@@ -216,7 +244,12 @@ def extract_plain_text(source: Path, include_thinking: bool, keep_noise: bool) -
 
             ts, role, msg = ctx
             who = role_label(role)
-            for kind, text in extract_items(msg, include_thinking=include_thinking):
+            for kind, text in extract_items(
+                msg,
+                include_thinking=include_thinking,
+                tool_use_names=tool_use_names,
+                omit_read_file_content=omit_read_file_content,
+            ):
                 text = trim_text(str(text))
                 if not text:
                     continue
@@ -244,6 +277,7 @@ def main() -> int:
         source=source,
         include_thinking=args.include_thinking,
         keep_noise=args.keep_noise,
+        omit_read_file_content=args.omit_read_file_content,
     )
 
     # Remove known garbage tokens.
