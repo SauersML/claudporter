@@ -29,14 +29,6 @@ NOISE_CONTENT_PREFIXES = (
 NOISE_LINE_RE = re.compile(r"^\[Request interrupted by user\]$")
 READ_FILE_LINE_RE = re.compile(r"^\s*\d+→")
 
-INTERACTIVE_ONLY_TOOLS = frozenset({
-    "Agent", "Task", "TodoWrite",
-    "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskOutput", "TaskStop",
-    "ScheduleWakeup", "EnterPlanMode", "ExitPlanMode",
-    "EnterWorktree", "ExitWorktree",
-    "Monitor", "AskUserQuestion",
-})
-
 RAW_EVENT_SENTINEL_KEYS = {"parentUuid", "isSidechain", "sessionId", "type", "timestamp"}
 
 DEFAULT_GIBBERISH_TOKEN = (
@@ -76,17 +68,18 @@ def _user_is_textual(row: dict) -> bool:
     return not row.get("isMeta")
 
 
+def session_is_interactive(rows: list[dict]) -> bool:
+    """A session counts as interactive iff it contains at least one
+    `file-history-snapshot` event. That event is emitted when a tool edits
+    a file in the workspace, which only happens when a human is driving.
+    Multi-turn eval harnesses (question → score-request) look
+    conversational but never touch the filesystem, so they fall through
+    to headless."""
+    return any(r.get("type") == "file-history-snapshot" for r in rows)
+
+
 def session_is_headless(rows: list[dict]) -> bool:
-    for r in rows:
-        t = r.get("type")
-        if t == "file-history-snapshot":
-            return False
-        if t == "assistant":
-            for part in (r.get("message", {}).get("content") or []):
-                if isinstance(part, dict) and part.get("type") == "tool_use":
-                    if part.get("name") in INTERACTIVE_ONLY_TOOLS:
-                        return False
-    return True
+    return not session_is_interactive(rows)
 
 
 # ---------- subagent & headless-child linking ----------
