@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Iterator
@@ -112,11 +113,9 @@ def extract_claude_p_prompt(bash_cmd: str) -> str | None:
     return m.group("prompt") if m else None
 
 
-def index_first_prompts(projects_dir: Path) -> dict[tuple[str, str], Path]:
+def index_first_prompts(session_paths: list[Path]) -> dict[tuple[str, str], Path]:
     idx: dict[tuple[str, str], Path] = {}
-    for fp in projects_dir.rglob("*.jsonl"):
-        if "/subagents/" in str(fp):
-            continue
+    for fp in session_paths:
         try:
             with fp.open(encoding="utf-8") as f:
                 for line in f:
@@ -134,6 +133,125 @@ def index_first_prompts(projects_dir: Path) -> dict[tuple[str, str], Path]:
         except OSError:
             pass
     return idx
+
+
+def _parse_ts(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _collect_bash_spans(rows: list[dict]) -> list[tuple[str, datetime, datetime, str]]:
+    """Return (tool_use_id, start, end, cwd) for each Bash with a matched tool_result."""
+    starts: dict[str, tuple[datetime | None, str]] = {}
+    spans: list[tuple[str, datetime, datetime, str]] = []
+    sess_cwd = ""
+    for r in rows:
+        if r.get("cwd"):
+            sess_cwd = r["cwd"]
+        if r.get("type") == "assistant":
+            sts = _parse_ts(r.get("timestamp"))
+            for b in (r.get("message", {}).get("content") or []):
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Bash":
+                    starts[b.get("id", "")] = (sts, sess_cwd)
+        if r.get("type") == "user":
+            c = r.get("message", {}).get("content")
+            if isinstance(c, list):
+                for p in c:
+                    if isinstance(p, dict) and p.get("type") == "tool_result":
+                        tid = p.get("tool_use_id", "")
+                        if tid in starts:
+                            sts, cwd = starts.pop(tid)
+                            ets = _parse_ts(r.get("timestamp"))
+                            if sts and ets and tid:
+                                spans.append((tid, sts, ets, cwd))
+    return spans
+
+
+def index_bash_owners(session_paths: list[Path]
+                      ) -> dict[str, tuple[datetime, datetime, str, Path]]:
+    """tool_use_id -> (start, end, cwd, source_jsonl) across interactive parents
+    and their subagents."""
+    out: dict[str, tuple[datetime, datetime, str, Path]] = {}
+    for fp in session_paths:
+        try:
+            rows = load_jsonl(fp)
+        except Exception:
+            continue
+        if session_is_headless(rows):
+            continue
+        for tid, s, e, cwd in _collect_bash_spans(rows):
+            out[tid] = (s, e, cwd, fp)
+        sub_dir = fp.parent / fp.stem / "subagents"
+        if sub_dir.is_dir():
+            for sfp in sub_dir.glob("*.jsonl"):
+                try:
+                    srows = load_jsonl(sfp)
+                except Exception:
+                    continue
+                for tid, s, e, cwd in _collect_bash_spans(srows):
+                    out[tid] = (s, e, cwd, sfp)
+    return out
+
+
+def _first_user_ts_cwd(path: Path) -> tuple[datetime | None, str]:
+    try:
+        with path.open(encoding="utf-8") as f:
+            cwd = ""
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if r.get("cwd") and not cwd:
+                    cwd = r["cwd"]
+                if r.get("type") == "user" and _user_is_textual(r):
+                    return _parse_ts(r.get("timestamp")), cwd or r.get("cwd", "")
+    except OSError:
+        pass
+    return None, ""
+
+
+MIN_SPAWNING_BASH_DURATION = timedelta(seconds=10)
+
+
+def link_headless_to_bash(
+    session_paths: list[Path],
+    bash_owners: dict[str, tuple[datetime, datetime, str, Path]],
+) -> dict[str, list[Path]]:
+    """Return tool_use_id -> [headless paths spawned during that Bash].
+
+    Only long-running Bash calls (≥10s) count: a command that returned in
+    0-1 seconds cannot have hosted a Claude subprocess that takes longer than
+    itself. The headless session's first user timestamp must fall strictly
+    within [start, end]."""
+    by_cwd: dict[str, list[tuple[str, datetime, datetime]]] = {}
+    for tid, (s, e, cwd, _src) in bash_owners.items():
+        if (e - s) < MIN_SPAWNING_BASH_DURATION:
+            continue
+        by_cwd.setdefault(cwd, []).append((tid, s, e))
+    children: dict[str, list[tuple[datetime, Path]]] = {}
+    for fp in session_paths:
+        try:
+            rows = load_jsonl(fp)
+        except Exception:
+            continue
+        if not session_is_headless(rows):
+            continue
+        ts, cwd = _first_user_ts_cwd(fp)
+        if not ts:
+            continue
+        best = None
+        for tid, s, e in by_cwd.get(cwd, []):
+            if s <= ts <= e:
+                if best is None or s > best[1]:
+                    best = (tid, s)
+        if best:
+            children.setdefault(best[0], []).append((ts, fp))
+    return {tid: [p for _, p in sorted(v)] for tid, v in children.items()}
 
 
 # ---------- rendering ----------
@@ -254,6 +372,7 @@ def render_session(
     source_path: Path,
     include_thinking: bool = False,
     first_prompt_index: dict[tuple[str, str], Path] | None = None,
+    headless_by_tool_use: dict[str, list[Path]] | None = None,
     visited: set[Path] | None = None,
     inlined_children: set[Path] | None = None,
     depth: int = 0,
@@ -262,6 +381,7 @@ def render_session(
     visited = visited if visited is not None else {source_path}
     inlined_children = inlined_children if inlined_children is not None else set()
     first_prompt_index = first_prompt_index if first_prompt_index is not None else {}
+    headless_by_tool_use = headless_by_tool_use if headless_by_tool_use is not None else {}
 
     headless = False if child_kind == "subagent" else session_is_headless(rows)
     indent = "  " * depth
@@ -294,6 +414,7 @@ def render_session(
             out.append(f"{indent}{label}{suffix}:\n{indented}\n")
 
             if kind == "TOOL_USE" and isinstance(part, dict):
+                # 1) explicit `claude -p` / Agent child
                 child_rows, child_path, child_tag = _resolve_child(
                     part, source_path, first_prompt_index, visited)
                 if child_rows and child_path is not None:
@@ -302,11 +423,34 @@ def render_session(
                         child_rows, source_path=child_path,
                         include_thinking=include_thinking,
                         first_prompt_index=first_prompt_index,
+                        headless_by_tool_use=headless_by_tool_use,
                         visited=visited,
                         inlined_children=inlined_children,
                         depth=depth + 1, child_kind=child_tag,
                     ))
                     out.append(f"{indent}└── end")
+                # 2) time-window matched headless children spawned by this Bash
+                tid = part.get("id", "")
+                if tid and tid in headless_by_tool_use:
+                    for hp in headless_by_tool_use[tid]:
+                        if hp in visited:
+                            continue
+                        visited.add(hp)
+                        inlined_children.add(hp)
+                        try:
+                            hrows = load_jsonl(hp)
+                        except Exception:
+                            continue
+                        out.append(render_session(
+                            hrows, source_path=hp,
+                            include_thinking=include_thinking,
+                            first_prompt_index=first_prompt_index,
+                            headless_by_tool_use=headless_by_tool_use,
+                            visited=visited,
+                            inlined_children=inlined_children,
+                            depth=depth + 1, child_kind="headless_child",
+                        ))
+                        out.append(f"{indent}└── end")
 
     return "\n".join(out)
 
@@ -360,7 +504,9 @@ def _infer_cwd(session_path: Path) -> str | None:
     return None
 
 
-def render_to_text(source: Path, first_prompt_index: dict, include_thinking: bool = False
+def render_to_text(source: Path, first_prompt_index: dict,
+                   headless_by_tool_use: dict[str, list[Path]] | None = None,
+                   include_thinking: bool = False
                    ) -> tuple[str, set[Path]]:
     rows = load_jsonl(source)
     inlined: set[Path] = set()
@@ -368,6 +514,7 @@ def render_to_text(source: Path, first_prompt_index: dict, include_thinking: boo
         rows, source_path=source,
         include_thinking=include_thinking,
         first_prompt_index=first_prompt_index,
+        headless_by_tool_use=headless_by_tool_use,
         inlined_children=inlined,
     )
     return text.replace(DEFAULT_GIBBERISH_TOKEN, "").strip() + "\n", inlined
@@ -375,35 +522,57 @@ def render_to_text(source: Path, first_prompt_index: dict, include_thinking: boo
 
 # ---------- batch mode ----------
 
-def _classify(source: Path) -> bool:
-    return session_is_headless(load_jsonl(source))
+def _cwd_to_slug(cwd: Path) -> str:
+    """Claude Code encodes cwd as project dir name: /A/B/C -> -A-B-C."""
+    parts = cwd.resolve().parts
+    if parts and parts[0] == "/":
+        parts = parts[1:]
+    return "-" + "-".join(p.replace("/", "-") for p in parts)
+
+
+def scoped_sessions(projects_dir: Path, cwd: Path) -> list[Path]:
+    """All session jsonl files under project dirs matching the current cwd's slug
+    (includes worktree-variant project dirs like `<slug>--claude-worktrees-…`)."""
+    slug = _cwd_to_slug(cwd)
+    out: list[Path] = []
+    for d in projects_dir.iterdir() if projects_dir.exists() else []:
+        if not d.is_dir():
+            continue
+        if d.name == slug or d.name.startswith(slug + "-"):
+            out.extend(f for f in d.glob("*.jsonl") if f.is_file())
+    return out
 
 
 def _render_worker(args):
-    source, first_prompt_index, include_thinking = args
+    source, first_prompt_index, headless_by_tool_use, include_thinking = args
     try:
-        text, inlined = render_to_text(source, first_prompt_index, include_thinking)
+        text, inlined = render_to_text(
+            source, first_prompt_index, headless_by_tool_use, include_thinking)
         return source, text, inlined, None
     except Exception as e:
         return source, "", set(), repr(e)
 
 
-def batch_port(projects_dir: Path, out_dir: Path, include_thinking: bool) -> None:
+def batch_port(projects_dir: Path, cwd: Path, out_dir: Path, include_thinking: bool) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     interactive_dir = out_dir / "interactive"
     headless_dir = out_dir / "headless"
     interactive_dir.mkdir(exist_ok=True)
     headless_dir.mkdir(exist_ok=True)
 
-    sources = [p for p in projects_dir.rglob("*.jsonl")
-               if p.is_file() and "/subagents/" not in str(p)]
-    print(f"sessions: {len(sources)}")
-    print(f"indexing first prompts…")
-    first_prompt_index = index_first_prompts(projects_dir)
-    print(f"  indexed {len(first_prompt_index)}")
+    sources = scoped_sessions(projects_dir, cwd)
+    if not sources:
+        print(f"no sessions under project slug for {cwd}")
+        return
+    print(f"scope: {cwd}  ({len(sources)} sessions)")
+    first_prompt_index = index_first_prompts(sources)
+    bash_owners = index_bash_owners(sources)
+    headless_by_tool_use = link_headless_to_bash(sources, bash_owners)
+    n_linked = sum(len(v) for v in headless_by_tool_use.values())
+    print(f"linked headless-by-timewindow: {n_linked}")
 
     workers = min(cpu_count(), 8)
-    jobs = [(p, first_prompt_index, include_thinking) for p in sources]
+    jobs = [(p, first_prompt_index, headless_by_tool_use, include_thinking) for p in sources]
 
     results: list[tuple[Path, str, set[Path], str | None]] = []
     with Pool(workers) as pool:
@@ -426,7 +595,7 @@ def batch_port(projects_dir: Path, out_dir: Path, include_thinking: bool) -> Non
             continue
         headless = session_is_headless(load_jsonl(source))
         dest_dir = headless_dir if headless else interactive_dir
-        proj_slug = source.parent.name.replace("-Users-", "").replace("-", "_")
+        proj_slug = source.parent.name.lstrip("-").replace("-", "_")
         fname = f"{proj_slug}__{source.stem}.txt"
         (dest_dir / fname).write_text(text, encoding="utf-8")
         if headless:
@@ -469,12 +638,15 @@ def main() -> int:
     if args.source is None:
         out_dir = (args.output.expanduser().resolve() if args.output
                    else Path.home() / ".claude" / "ported")
-        batch_port(projects_dir, out_dir, args.thinking)
+        batch_port(projects_dir, Path.cwd(), out_dir, args.thinking)
         return 0
 
     source = args.source.expanduser().resolve()
-    first_prompt_index = index_first_prompts(projects_dir)
-    text, _ = render_to_text(source, first_prompt_index, args.thinking)
+    sources_in_scope = scoped_sessions(projects_dir, Path.cwd()) or [source]
+    first_prompt_index = index_first_prompts(sources_in_scope)
+    bash_owners = index_bash_owners(sources_in_scope)
+    headless_by_tool_use = link_headless_to_bash(sources_in_scope, bash_owners)
+    text, _ = render_to_text(source, first_prompt_index, headless_by_tool_use, args.thinking)
 
     out = (args.output.expanduser().resolve() if args.output
            else Path.home() / ".claude" / "most_recent_conversation_plain.txt")
